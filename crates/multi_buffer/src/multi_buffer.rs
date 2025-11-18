@@ -17,7 +17,7 @@ use buffer_diff::{
 };
 use clock::ReplicaId;
 use collections::{BTreeMap, Bound, HashMap, HashSet};
-use gpui::{App, Context, Entity, EntityId, EventEmitter};
+use gpui::{AnyEntity, App, Context, Entity, EntityId, EventEmitter};
 use itertools::Itertools;
 use language::{
     AutoindentMode, Buffer, BufferChunks, BufferRow, BufferSnapshot, Capability, CharClassifier,
@@ -89,7 +89,11 @@ pub struct MultiBuffer {
     /// The writing capability of the multi-buffer.
     capability: Capability,
     buffer_changed_since_sync: Rc<Cell<bool>>,
+    follower: Option<AnyEntity>,
 }
+
+struct TerribleUnpinWrapper<T>(pub T);
+impl<T> Unpin for TerribleUnpinWrapper<T> {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Event {
@@ -612,6 +616,7 @@ impl MultiBuffer {
             paths_by_excerpt: Default::default(),
             buffer_changed_since_sync: Default::default(),
             history: History::default(),
+            follower: None,
         }
     }
 
@@ -654,7 +659,26 @@ impl MultiBuffer {
             history: self.history.clone(),
             title: self.title.clone(),
             buffer_changed_since_sync,
+            follower: None,
         }
+    }
+
+    pub fn follower(&mut self, cx: &mut Context<Self>) -> Entity<MultiBuffer> {
+        use gpui::AppContext as _;
+
+        if let Some(follower) = self.get_follower() {
+            return follower.clone();
+        }
+
+        let follower = cx.new(|cx| self.clone(cx));
+        self.follower = Some(follower.clone().into_any());
+        follower
+    }
+
+    fn get_follower(&self) -> Option<Entity<MultiBuffer>> {
+        self.follower
+            .clone()
+            .and_then(|follower| follower.downcast().ok())
     }
 
     pub fn set_group_interval(&mut self, group_interval: Duration) {
@@ -1311,6 +1335,17 @@ impl MultiBuffer {
             self.subscriptions.publish(edits);
         }
 
+        if let Some(follower) = self.get_follower() {
+            follower.update(cx, |follower, cx| {
+                follower.insert_excerpts_with_ids_after(
+                    prev_excerpt_id,
+                    buffer.clone(),
+                    ranges,
+                    cx,
+                );
+            })
+        }
+
         cx.emit(Event::Edited {
             edited_buffer: None,
         });
@@ -1363,6 +1398,11 @@ impl MultiBuffer {
         );
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
+        }
+        if let Some(follower) = self.get_follower() {
+            follower.update(cx, |follower, cx| {
+                follower.clear(cx);
+            })
         }
         cx.emit(Event::Edited {
             edited_buffer: None,
@@ -2287,6 +2327,11 @@ impl MultiBuffer {
         let edits = Self::sync_diff_transforms(&mut snapshot, edits, DiffChangeKind::BufferEdited);
         if !edits.is_empty() {
             self.subscriptions.publish(edits);
+        }
+        if let Some(follower) = self.get_follower() {
+            follower.update(cx, |follower, cx| {
+                follower.expand_excerpts(ids.clone(), line_count, direction, cx);
+            })
         }
         cx.emit(Event::Edited {
             edited_buffer: None,
